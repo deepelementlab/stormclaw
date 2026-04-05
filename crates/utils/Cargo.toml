@@ -1,0 +1,22 @@
+[package]
+name = "stormclaw-utils"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# 工作空间依赖
+anyhow = { workspace = true }
+chrono = { workspace = true }
+walkdir = { workspace = true }
+which = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+# 额外依赖
+dirs = "5.0"
+regex = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

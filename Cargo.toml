@@ -1,0 +1,94 @@
+[workspace]
+members = ["crates/*", "cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["stormclaw contributors"]
+license = "MIT"
+repository = "https://github.com/deepelementlab/stormclaw"
+homepage = "https://github.com/deepelementlab/stormclaw"
+
+[workspace.dependencies]
+# 异步运行时
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 配置
+config = "0.14"
+
+# HTTP 客户端
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# LLM
+async-openai = "0.24"
+async-trait = "0.1"
+
+# Telegram
+teloxide = { version = "0.12", features = ["macros"] }
+
+# WebSocket
+tokio-tungstenite = "0.24"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+dialoguer = "0.11"
+indicatif = "0.17"
+
+# 定时任务
+tokio-cron-scheduler = "0.10"
+cron = "0.12"
+
+# 工具
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+regex = "1.11"
+
+# 文件系统
+walkdir = "2.5"
+
+# 模板
+tera = "1.20"
+
+# 条件编译
+cfg-if = "1.0"
+
+# Shell 命令
+which = "6.0"
+
+# 系统目录
+dirs = "5.0"
+
+# 表格显示
+comfy-table = "7.1"
+
+# 命令行输入
+rustyline = "14.0"
+
+# 测试依赖
+tokio-test = "0.4"
+mockall = "0.13"
+wiremock = "0.6"
+tempfile = "3.12"
+proptest = "1.4"
+serial_test = "3"
+criterion = "0.5"
+# 性能优化
+lru = "0.12"
+# 邮件解析
+mail-parser = "0.9"
+async-native-tls = "0.5"

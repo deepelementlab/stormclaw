@@ -1,0 +1,30 @@
+[package]
+name = "stormclaw-benches"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "bench-helper"
+path = "helper.rs"
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true }
+stormclaw-core = { path = "../crates/core" }
+
+[[bench]]
+name = "agent_loop"
+harness = false
+
+[[bench]]
+name = "message_bus"
+harness = false
+
+[[bench]]
+name = "tool_execution"
+harness = false
+
+[[bench]]
+name = "agent_throughput"
+harness = false

@@ -1,0 +1,52 @@
+[package]
+name = "stormclaw-channels"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# 工作空间依赖
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+teloxide = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+futures = "0.3"
+
+# 额外依赖
+futures-util = "0.3"
+axum = "0.7"
+
+# Email 支持
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "smtp-transport", "builder", "tokio1-native-tls"] }
+regex = "1.11"
+dirs = { workspace = true }
+
+# Discord Gateway 支持 (可选)
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"], optional = true }
+async-imap = { version = "0.9", optional = true }
+async-native-tls = { workspace = true, optional = true }
+mail-parser = { workspace = true, optional = true }
+
+# 内部依赖
+stormclaw-core = { path = "../core" }
+stormclaw-config = { path = "../config" }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+mockall = { workspace = true }
+
+[features]
+default = []
+discord-gateway = ["serenity"]
+email-imap = ["async-imap", "async-native-tls", "mail-parser"]

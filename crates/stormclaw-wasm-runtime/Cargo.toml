@@ -1,0 +1,13 @@
+[package]
+name = "stormclaw-wasm-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Minimal wasmtime host for stormclaw wasm-tools feature"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+wasmtime = "21"
+wat = "1"

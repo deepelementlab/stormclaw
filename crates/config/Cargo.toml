@@ -1,0 +1,24 @@
+[package]
+name = "stormclaw-config"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# 工作空间依赖
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+config = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+
+# 内部依赖
+stormclaw-utils = { path = "../utils" }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
+serial_test = { workspace = true }
