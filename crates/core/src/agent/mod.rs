@@ -10,6 +10,7 @@ pub mod runtime_state;
 pub mod path_policy;
 pub mod docker_exec;
 pub mod tool_executor;
+pub mod tool_policy;
 
 pub use runtime_state::AgentRuntimeState;
 pub use r#loop::AgentLoop;

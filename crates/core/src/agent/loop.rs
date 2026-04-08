@@ -3,23 +3,27 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use serde_json::Value;
 
-use crate::bus::{MessageBus, InboundMessage, OutboundMessage};
-use crate::providers::{LLMProvider, ChatMessage, OpenAIProvider};
+use stormclaw_config::{IngressMode, SecurityConfig};
+
+use crate::agent::subagent::SubagentManager;
+use crate::agent::tool_executor::{ToolExecutor, ToolInvocationContext};
+use crate::agent::tools::{
+    normalize_tool_arguments, EditFileTool, ExecTool, ListDirTool, MessageTool, ReadFileTool,
+    SpawnTool, Tool, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
+};
+#[cfg(feature = "wasm-tools")]
+use crate::agent::tools::WasmEvalTool;
 use crate::agent::context::ContextBuilder;
 use crate::agent::runtime_state::AgentRuntimeState;
-use crate::agent::tools::{Tool, ToolRegistry, ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, ExecTool, WebSearchTool, WebFetchTool, MessageTool, SpawnTool};
-use crate::agent::subagent::SubagentManager;
+use crate::bus::{InboundMessage, MessageBus, OutboundMessage};
+use crate::providers::{ChatMessage, LLMProvider, OpenAIProvider};
 use crate::session::SessionManager;
 
 /// Agent 循环引擎
-///
-/// 核心处理逻辑：接收消息、构建上下文、调用 LLM、执行工具、发送响应
 pub struct AgentLoop<P: LLMProvider + 'static> {
     bus: Arc<MessageBus>,
     provider: Arc<P>,
-    /// 可由 Gateway 热重载；`pub(crate)` 供同 crate 测试断言
     pub(crate) runtime: Arc<RwLock<AgentRuntimeState>>,
     context: Arc<RwLock<ContextBuilder>>,
     sessions: SessionManager,
@@ -28,6 +32,7 @@ pub struct AgentLoop<P: LLMProvider + 'static> {
     message_tool: Arc<MessageTool>,
     spawn_tool: Arc<SpawnTool<P>>,
     running: Arc<RwLock<bool>>,
+    tool_executor: Arc<ToolExecutor>,
 }
 
 impl<P: LLMProvider + 'static> AgentLoop<P> {
@@ -39,6 +44,7 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
         model: Option<String>,
         max_iterations: usize,
         brave_api_key: Option<String>,
+        security: SecurityConfig,
     ) -> anyhow::Result<Self> {
         let runtime = Arc::new(RwLock::new(AgentRuntimeState {
             workspace: workspace.clone(),
@@ -49,10 +55,12 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
         let context = Arc::new(RwLock::new(ContextBuilder::new(workspace.clone())));
         let sessions = SessionManager::new(workspace.clone()).await?;
         let tools = Arc::new(ToolRegistry::new());
+        let tool_executor = Arc::new(ToolExecutor::new(security));
         let subagents = Arc::new(SubagentManager::new(
             provider.clone(),
             runtime.clone(),
             bus.clone(),
+            tool_executor.clone(),
         ));
         let message_tool = Arc::new(MessageTool::new(bus.clone()));
         let spawn_tool = Arc::new(SpawnTool::new(subagents.clone(), bus.clone()));
@@ -68,6 +76,7 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
             message_tool,
             spawn_tool,
             running: Arc::new(RwLock::new(false)),
+            tool_executor,
         })
     }
 
@@ -76,7 +85,6 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
         *self.running.write().await = true;
         tracing::info!("Agent loop started");
 
-        // 注册默认工具
         self.register_default_tools().await;
 
         while *self.running.read().await {
@@ -99,7 +107,6 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
 
     /// 直接处理一条消息并返回响应文本（用于 CLI/Cron/Heartbeat/Gateway 调用）
     pub async fn process_direct(&self, content: &str, session_key: &str) -> anyhow::Result<String> {
-        // session_key 形如 "channel:chat_id"；若缺少 ':' 则 fallback 为 "cli:<session_key>"
         let (channel, chat_id) = if let Some(idx) = session_key.find(':') {
             (session_key[..idx].to_string(), session_key[idx + 1..].to_string())
         } else {
@@ -111,18 +118,52 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
         Ok(out.map(|m| m.content).unwrap_or_default())
     }
 
-    /// 供 Gateway 使用：获取会话管理器
     pub fn session_manager(&self) -> SessionManager {
         self.sessions.clone()
     }
 
-    /// 停止 Agent 循环
     pub async fn stop(&self) {
         *self.running.write().await = false;
         tracing::info!("Agent loop stopping");
     }
 
-    /// 处理消息（可选择是否发布 OutboundMessage 到总线）
+    async fn apply_ingress(&self, content: &str) -> Result<String, String> {
+        let mode = self.tool_executor.security_snapshot().await.ingress_mode;
+        match mode {
+            IngressMode::Off => Ok(content.to_string()),
+            IngressMode::Warn => {
+                if let Some(w) = self.tool_executor.scan_inbound_secrets(content).await {
+                    tracing::warn!(target: "stormclaw_security", "{}", w);
+                }
+                let v = self.tool_executor.validate_user_text(content).await;
+                if !v.is_valid {
+                    tracing::warn!(
+                        target: "stormclaw_security",
+                        "Ingress validation warnings: {:?}",
+                        v.errors
+                    );
+                }
+                Ok(content.to_string())
+            }
+            IngressMode::Enforce => {
+                if let Some(w) = self.tool_executor.scan_inbound_secrets(content).await {
+                    return Err(w);
+                }
+                let v = self.tool_executor.validate_user_text(content).await;
+                if !v.is_valid {
+                    let msg = v
+                        .errors
+                        .iter()
+                        .map(|e| format!("{}: {}", e.field, e.message))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(format!("Message rejected: {}", msg));
+                }
+                Ok(content.to_string())
+            }
+        }
+    }
+
     async fn handle_message(
         &self,
         msg: InboundMessage,
@@ -131,7 +172,6 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
     ) -> anyhow::Result<Option<OutboundMessage>> {
         tracing::info!("Processing message from {}:{}", msg.channel, msg.sender_id);
 
-        // 处理系统消息（子代理公布）
         if msg.channel == "system" {
             return self.process_system_message(msg, publish_outbound).await;
         }
@@ -139,14 +179,27 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
         let session_key = session_key_override.unwrap_or_else(|| msg.session_key());
         let session = self.sessions.get_or_create(&session_key).await?;
 
-        // 更新工具上下文（channel, chat_id），用于 message/spawn 默认路由
-        self.message_tool.set_context(msg.channel.clone(), msg.chat_id.clone()).await;
-        self.spawn_tool.set_context(msg.channel.clone(), msg.chat_id.clone()).await;
+        self.message_tool
+            .set_context(msg.channel.clone(), msg.chat_id.clone())
+            .await;
+        self.spawn_tool
+            .set_context(msg.channel.clone(), msg.chat_id.clone())
+            .await;
 
-        // 构建 LLM 消息列表（system + history + current）
-        let mut messages = self.build_llm_messages(&session, &msg.content).await?;
+        let user_body = match self.apply_ingress(&msg.content).await {
+            Ok(s) => s,
+            Err(user_reply) => {
+                let response =
+                    OutboundMessage::new(msg.channel.clone(), msg.chat_id.clone(), user_reply);
+                if publish_outbound {
+                    self.bus.publish_outbound(response.clone()).await?;
+                }
+                return Ok(Some(response));
+            }
+        };
 
-        // Agent 循环
+        let mut messages = self.build_llm_messages(&session, &user_body).await?;
+
         let mut final_content = None;
 
         let max_iterations = self.runtime.read().await.max_iterations;
@@ -158,26 +211,36 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
                     .unwrap_or_else(|| self.provider.get_default_model())
             };
 
-            let response = self.provider.chat(
-                messages.clone(),
-                Some(self.tools.get_definitions().await),
-                Some(model.as_str()),
-            ).await?;
+            let response = self
+                .provider
+                .chat(
+                    messages.clone(),
+                    Some(self.tools.get_definitions().await),
+                    Some(model.as_str()),
+                )
+                .await?;
 
             if response.has_tool_calls() {
-                // 添加 assistant 消息，包含 tool_calls（对齐 OpenAI tool_calls 语义）
-                let mut assistant = ChatMessage::assistant(response.content.clone().unwrap_or_default());
+                let mut assistant =
+                    ChatMessage::assistant(response.content.clone().unwrap_or_default());
                 assistant.tool_calls = Some(response.tool_calls.clone());
                 messages.push(assistant);
 
-                // 执行工具
                 for tool_call in response.tool_calls {
                     tracing::debug!("Executing tool: {}", tool_call.name);
 
                     let args = normalize_tool_arguments(&tool_call.arguments)?;
-                    let result = self.tools.execute(&tool_call.name, args).await?;
+                    let ctx = ToolInvocationContext {
+                        session_key: session_key.clone(),
+                        channel: msg.channel.clone(),
+                        subagent_id: None,
+                        session_policy_mode: None,
+                    };
+                    let result = self
+                        .tool_executor
+                        .execute(&self.tools, &tool_call.name, args, &ctx)
+                        .await?;
 
-                    // 添加工具结果消息
                     messages.push(ChatMessage::tool(result, tool_call.id));
                 }
             } else {
@@ -186,17 +249,15 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
             }
         }
 
-        let content = final_content.unwrap_or_else(||
+        let content = final_content.unwrap_or_else(|| {
             "I've completed processing but have no response to give.".to_string()
-        );
+        });
 
-        // 保存会话
         let mut session = session;
-        session.add_message("user", &msg.content);
+        session.add_message("user", &user_body);
         session.add_message("assistant", &content);
         self.sessions.save(&session).await?;
 
-        // 发送响应
         let response = OutboundMessage::new(msg.channel, msg.chat_id, content);
         if publish_outbound {
             self.bus.publish_outbound(response.clone()).await?;
@@ -205,11 +266,13 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
         Ok(Some(response))
     }
 
-    /// 处理系统消息（子代理结果）
-    async fn process_system_message(&self, msg: InboundMessage, publish_outbound: bool) -> anyhow::Result<Option<OutboundMessage>> {
+    async fn process_system_message(
+        &self,
+        msg: InboundMessage,
+        publish_outbound: bool,
+    ) -> anyhow::Result<Option<OutboundMessage>> {
         tracing::info!("Processing system message from {}", msg.sender_id);
 
-        // 解析原始渠道
         let (origin_channel, origin_chat_id) = if let Some(idx) = msg.chat_id.find(':') {
             (&msg.chat_id[..idx], &msg.chat_id[idx + 1..])
         } else {
@@ -219,13 +282,15 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
         let session_key = format!("{}:{}", origin_channel, origin_chat_id);
         let session = self.sessions.get_or_create(&session_key).await?;
 
-        // 更新工具上下文（按 origin 路由）
-        self.message_tool.set_context(origin_channel.to_string(), origin_chat_id.to_string()).await;
-        self.spawn_tool.set_context(origin_channel.to_string(), origin_chat_id.to_string()).await;
+        self.message_tool
+            .set_context(origin_channel.to_string(), origin_chat_id.to_string())
+            .await;
+        self.spawn_tool
+            .set_context(origin_channel.to_string(), origin_chat_id.to_string())
+            .await;
 
         let mut messages = self.build_llm_messages(&session, &msg.content).await?;
 
-        // 简化的 Agent 循环用于处理系统消息
         let max_iterations = self.runtime.read().await.max_iterations;
         for _ in 0..max_iterations {
             let model = {
@@ -235,23 +300,43 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
                     .unwrap_or_else(|| self.provider.get_default_model())
             };
 
-            let response = self.provider.chat(
-                messages.clone(),
-                Some(self.tools.get_definitions().await),
-                Some(model.as_str()),
-            ).await?;
+            let response = self
+                .provider
+                .chat(
+                    messages.clone(),
+                    Some(self.tools.get_definitions().await),
+                    Some(model.as_str()),
+                )
+                .await?;
 
             if response.has_tool_calls() {
+                let mut assistant =
+                    ChatMessage::assistant(response.content.clone().unwrap_or_default());
+                assistant.tool_calls = Some(response.tool_calls.clone());
+                messages.push(assistant);
+
                 for tool_call in response.tool_calls {
                     let args = normalize_tool_arguments(&tool_call.arguments)?;
-                    let result = self.tools.execute(&tool_call.name, args).await?;
+                    let ctx = ToolInvocationContext {
+                        session_key: session_key.clone(),
+                        channel: origin_channel.to_string(),
+                        subagent_id: None,
+                        session_policy_mode: None,
+                    };
+                    let result = self
+                        .tool_executor
+                        .execute(&self.tools, &tool_call.name, args, &ctx)
+                        .await?;
                     messages.push(ChatMessage::tool(result, tool_call.id));
                 }
             } else {
                 let content = response.content.unwrap_or_default();
 
                 let mut session = session;
-                session.add_message("user", &format!("[System: {}] {}", msg.sender_id, msg.content));
+                session.add_message(
+                    "user",
+                    &format!("[System: {}] {}", msg.sender_id, msg.content),
+                );
                 session.add_message("assistant", &content);
                 self.sessions.save(&session).await?;
 
@@ -266,8 +351,11 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
         Ok(None)
     }
 
-    /// 构建 LLM 消息列表（对齐 Python：system + history(role/content) + current user）
-    async fn build_llm_messages(&self, session: &crate::session::Session, current_message: &str) -> anyhow::Result<Vec<ChatMessage>> {
+    async fn build_llm_messages(
+        &self,
+        session: &crate::session::Session,
+        current_message: &str,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
         let mut messages = Vec::new();
         let system_prompt = self.context.read().await.build_system_prompt(None);
         messages.push(ChatMessage::system(system_prompt));
@@ -275,47 +363,77 @@ impl<P: LLMProvider + 'static> AgentLoop<P> {
         for m in session.get_history(50) {
             let role = m.get("role").cloned().unwrap_or_default();
             let content = m.get("content").cloned().unwrap_or_default();
-            messages.push(ChatMessage { role, content, tool_call_id: None, tool_calls: None });
+            messages.push(ChatMessage {
+                role,
+                content,
+                tool_call_id: None,
+                tool_calls: None,
+            });
         }
 
         messages.push(ChatMessage::user(current_message));
         Ok(messages)
     }
 
-    /// 注册默认工具
     async fn register_default_tools(&self) {
         let (workspace, brave_api_key) = {
             let rt = self.runtime.read().await;
             (rt.workspace.clone(), rt.brave_api_key.clone())
         };
 
-        // 文件工具
-        self.tools.register(Arc::new(ReadFileTool) as Arc<dyn Tool>).await;
-        self.tools.register(Arc::new(WriteFileTool) as Arc<dyn Tool>).await;
-        self.tools.register(Arc::new(EditFileTool) as Arc<dyn Tool>).await;
-        self.tools.register(Arc::new(ListDirTool) as Arc<dyn Tool>).await;
+        let sec = self.tool_executor.security_snapshot().await;
+        let docker = sec.docker.clone();
 
-        // Shell 工具
-        self.tools.register(Arc::new(ExecTool::new(
-            workspace.to_string_lossy().to_string()
-        )) as Arc<dyn Tool>).await;
+        self.tools
+            .register(Arc::new(ReadFileTool {
+                workspace_root: workspace.clone(),
+            }) as Arc<dyn Tool>)
+            .await;
+        self.tools
+            .register(Arc::new(WriteFileTool {
+                workspace_root: workspace.clone(),
+            }) as Arc<dyn Tool>)
+            .await;
+        self.tools
+            .register(Arc::new(EditFileTool {
+                workspace_root: workspace.clone(),
+            }) as Arc<dyn Tool>)
+            .await;
+        self.tools
+            .register(Arc::new(ListDirTool {
+                workspace_root: workspace.clone(),
+            }) as Arc<dyn Tool>)
+            .await;
 
-        // Web 工具
-        self.tools.register(Arc::new(WebSearchTool::new(brave_api_key)) as Arc<dyn Tool>).await;
-        self.tools.register(Arc::new(WebFetchTool) as Arc<dyn Tool>).await;
+        self.tools
+            .register(Arc::new(ExecTool::new(workspace.clone(), docker)) as Arc<dyn Tool>)
+            .await;
 
-        // 消息工具
-        self.tools.register(self.message_tool.clone() as Arc<dyn Tool>).await;
+        self.tools
+            .register(Arc::new(WebSearchTool::new(brave_api_key)) as Arc<dyn Tool>)
+            .await;
+        self.tools
+            .register(Arc::new(WebFetchTool) as Arc<dyn Tool>)
+            .await;
 
-        // 子代理工具
-        self.tools.register(self.spawn_tool.clone() as Arc<dyn Tool>).await;
+        self.tools
+            .register(self.message_tool.clone() as Arc<dyn Tool>)
+            .await;
+
+        self.tools
+            .register(self.spawn_tool.clone() as Arc<dyn Tool>)
+            .await;
+
+        #[cfg(feature = "wasm-tools")]
+        if sec.wasm_tools_enabled {
+            self.tools
+                .register(Arc::new(WasmEvalTool) as Arc<dyn Tool>)
+                .await;
+        }
     }
 }
 
 impl AgentLoop<OpenAIProvider> {
-    /// Gateway 配置热重载：刷新 LLM 凭据、默认模型、迭代上限、Brave Key 与工具表。
-    ///
-    /// 若配置中的工作区与当前运行时不一致，不切换工作区（会话仍绑定原路径），需重启网关。
     pub async fn apply_gateway_hot_reload(
         &self,
         api_key: String,
@@ -324,6 +442,7 @@ impl AgentLoop<OpenAIProvider> {
         max_iterations: usize,
         brave_api_key: Option<String>,
         new_workspace: PathBuf,
+        security: SecurityConfig,
     ) -> anyhow::Result<()> {
         self.provider
             .apply_credentials(api_key, api_base, default_model.clone());
@@ -342,6 +461,8 @@ impl AgentLoop<OpenAIProvider> {
             rt.brave_api_key = brave_api_key;
         }
 
+        self.tool_executor.refresh_security(security).await;
+
         self.tools.clear().await;
         self.register_default_tools().await;
 
@@ -349,20 +470,13 @@ impl AgentLoop<OpenAIProvider> {
     }
 }
 
-fn normalize_tool_arguments(args: &Value) -> anyhow::Result<Value> {
-    match args {
-        Value::String(s) => Ok(serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone()))),
-        other => Ok(other.clone()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MockLLMProvider, create_test_workspace};
+    use crate::testing::{create_test_workspace, MockLLMProvider};
 
-    // 创建测试用的 Agent 循环
-    async fn create_test_agent_loop() -> anyhow::Result<(AgentLoop<MockLLMProvider>, tempfile::TempDir)> {
+    async fn create_test_agent_loop() -> anyhow::Result<(AgentLoop<MockLLMProvider>, tempfile::TempDir)>
+    {
         let (workspace, temp_dir) = create_test_workspace().await?;
         let bus = Arc::new(MessageBus::new(1000));
         let provider = Arc::new(MockLLMProvider::new().with_model("gpt-4"));
@@ -374,7 +488,9 @@ mod tests {
             Some("gpt-4".to_string()),
             5,
             None,
-        ).await?;
+            SecurityConfig::default(),
+        )
+        .await?;
 
         Ok((agent, temp_dir))
     }
@@ -391,15 +507,12 @@ mod tests {
 
         let agent = Arc::new(agent);
 
-        // 启动循环（后台）
         let agent_for_task = agent.clone();
         let handle = tokio::spawn(async move { agent_for_task.run().await });
 
-        // 等待启动
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         assert!(*agent.running.read().await);
 
-        // 请求停止并确保任务退出
         agent.stop().await;
         let joined = tokio::time::timeout(tokio::time::Duration::from_millis(300), handle).await;
         assert!(joined.is_ok());
@@ -409,10 +522,8 @@ mod tests {
     async fn test_agent_tools_registered() {
         let (agent, _temp_dir) = create_test_agent_loop().await.unwrap();
 
-        // 注册默认工具
         agent.register_default_tools().await;
 
-        // 验证工具已注册
         assert!(agent.tools.has("read_file").await);
         assert!(agent.tools.has("write_file").await);
         assert!(agent.tools.has("exec").await);
@@ -423,9 +534,11 @@ mod tests {
     async fn test_build_llm_messages() {
         let (agent, _temp_dir) = create_test_agent_loop().await.unwrap();
         let session = agent.sessions.get_or_create("cli:direct").await.unwrap();
-        let messages = agent.build_llm_messages(&session, "Current message").await.unwrap();
+        let messages = agent
+            .build_llm_messages(&session, "Current message")
+            .await
+            .unwrap();
 
-        // system + current (session history 为空)
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].content, "Current message");
@@ -442,9 +555,12 @@ mod tests {
             provider,
             workspace,
             Some("gpt-4".to_string()),
-            3, // 设置较小的迭代次数
+            3,
             None,
-        ).await.unwrap();
+            SecurityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(agent.runtime.read().await.max_iterations, 3);
 
@@ -464,7 +580,10 @@ mod tests {
             Some("custom-model".to_string()),
             5,
             None,
-        ).await.unwrap();
+            SecurityConfig::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             agent.runtime.read().await.model.as_ref().unwrap(),
@@ -478,8 +597,11 @@ mod tests {
     async fn test_agent_session_integration() {
         let (agent, _temp_dir) = create_test_agent_loop().await.unwrap();
 
-        // 创建会话
-        let session = agent.sessions.get_or_create("telegram:chat123").await.unwrap();
+        let session = agent
+            .sessions
+            .get_or_create("telegram:chat123")
+            .await
+            .unwrap();
         assert_eq!(session.key, "telegram:chat123");
     }
 
@@ -488,7 +610,6 @@ mod tests {
         let (agent, _temp_dir) = create_test_agent_loop().await.unwrap();
         agent.register_default_tools().await;
 
-        // 测试工具查找
         let read_file_tool = agent.tools.get("read_file").await;
         assert!(read_file_tool.is_some());
         assert_eq!(read_file_tool.unwrap().name(), "read_file");

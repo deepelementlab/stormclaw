@@ -196,6 +196,7 @@ impl<P: LLMProvider + 'static> SubagentManager<P> {
                         session_key: session_key.clone(),
                         channel: "subagent".to_string(),
                         subagent_id: Some(task_id.clone()),
+                        session_policy_mode: None,
                     };
                     let result = tool_executor
                         .execute(&tools, &tool_call.name, args, &ctx)
@@ -231,7 +232,7 @@ impl<P: LLMProvider + 'static> SubagentManager<P> {
     /// 公布子代理结果
     async fn announce_result(
         bus: &MessageBus,
-        task_id: &str,
+        _task_id: &str,
         label: &str,
         task: &str,
         result: &str,

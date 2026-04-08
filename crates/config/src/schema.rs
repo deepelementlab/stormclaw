@@ -333,6 +333,18 @@ pub struct DockerSecurityConfig {
     pub workspace_writable: bool,
     #[serde(default = "default_docker_memory_mb")]
     pub memory_mb: u32,
+    /// CPU 限额（传给 `docker run --cpus`），如 "0.5" / "1.0"
+    #[serde(default)]
+    pub cpus: Option<String>,
+    /// PID 上限（传给 `docker run --pids-limit`）
+    #[serde(default)]
+    pub pids_limit: Option<u32>,
+    /// 临时目录大小（MB），将挂载到 `/tmp`（tmpfs）
+    #[serde(default = "default_tmpfs_size_mb")]
+    pub tmpfs_size_mb: u32,
+    /// Docker no-new-privileges
+    #[serde(default = "default_true")]
+    pub no_new_privileges: bool,
     /// 使用 `--network none` 隔离出站
     #[serde(default = "default_true")]
     pub network_isolated: bool,
@@ -349,6 +361,10 @@ fn default_docker_memory_mb() -> u32 {
     512
 }
 
+fn default_tmpfs_size_mb() -> u32 {
+    64
+}
+
 impl Default for DockerSecurityConfig {
     fn default() -> Self {
         Self {
@@ -356,6 +372,10 @@ impl Default for DockerSecurityConfig {
             image: default_docker_image(),
             workspace_writable: false,
             memory_mb: default_docker_memory_mb(),
+            cpus: None,
+            pids_limit: Some(128),
+            tmpfs_size_mb: default_tmpfs_size_mb(),
+            no_new_privileges: true,
             network_isolated: true,
             fallback_to_host: false,
         }
@@ -381,9 +401,24 @@ pub struct SecurityConfig {
     pub validator_strict: bool,
     #[serde(default = "default_tool_timeout_secs")]
     pub default_tool_timeout_secs: u64,
+    /// 按工具类别覆盖超时（秒），键示例：filesystem_read/filesystem_write/network/shell/meta
+    #[serde(default)]
+    pub category_timeout_secs: HashMap<String, u64>,
     /// 按工具名覆盖超时（秒）
     #[serde(default)]
     pub tool_timeout_secs: HashMap<String, u64>,
+    /// 按工具名覆盖策略
+    #[serde(default)]
+    pub tool_policies: HashMap<String, ToolPolicyConfig>,
+    /// 按渠道覆盖安全策略（键为 channel 名）
+    #[serde(default)]
+    pub channel_policies: HashMap<String, SecurityPolicyOverride>,
+    /// 会话级策略模式（默认继承全局）
+    #[serde(default)]
+    pub session_policy_mode: SessionPolicyMode,
+    /// 安全审计采样配置
+    #[serde(default)]
+    pub security_audit: SecurityAuditConfig,
     #[serde(default)]
     pub docker: DockerSecurityConfig,
     /// 为 true 且编译启用 `wasm-tools` 特性时注册 WASM 演示工具
@@ -412,9 +447,120 @@ impl Default for SecurityConfig {
             injection_check_on_tool_output: true,
             validator_strict: false,
             default_tool_timeout_secs: default_tool_timeout_secs(),
+            category_timeout_secs: HashMap::new(),
             tool_timeout_secs: HashMap::new(),
+            tool_policies: HashMap::new(),
+            channel_policies: HashMap::new(),
+            session_policy_mode: SessionPolicyMode::Inherit,
+            security_audit: SecurityAuditConfig::default(),
             docker: DockerSecurityConfig::default(),
             wasm_tools_enabled: false,
+        }
+    }
+}
+
+/// 工具风险等级（仅用于策略和审计标注）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolRiskLevel {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+/// 单工具策略覆盖（未设置字段沿用全局行为）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolPolicyConfig {
+    /// 为 false 时直接拒绝该工具
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 为 true 时该工具必须在 Docker 隔离执行
+    #[serde(default)]
+    pub require_docker: bool,
+    /// 为 false 时该工具不允许发起网络访问（主要用于网络类工具）
+    #[serde(default = "default_true")]
+    pub allow_network: bool,
+    /// 单工具输出上限（字节）
+    #[serde(default)]
+    pub max_output_bytes: Option<usize>,
+    /// 参数 JSON 序列化后最大字节数
+    #[serde(default)]
+    pub max_args_bytes: Option<usize>,
+    /// 发现任一子串则拒绝（用于快速阻断危险片段）
+    #[serde(default)]
+    pub deny_patterns: Vec<String>,
+    /// 风险等级标签
+    #[serde(default)]
+    pub risk_level: ToolRiskLevel,
+}
+
+impl Default for ToolPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            require_docker: false,
+            allow_network: true,
+            max_output_bytes: None,
+            max_args_bytes: None,
+            deny_patterns: Vec::new(),
+            risk_level: ToolRiskLevel::Low,
+        }
+    }
+}
+
+/// 会话策略模式
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionPolicyMode {
+    #[default]
+    Inherit,
+    Baseline,
+    Strict,
+}
+
+/// 渠道级策略覆盖（仅覆盖提供的字段）
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityPolicyOverride {
+    #[serde(default)]
+    pub ingress_mode: Option<IngressMode>,
+    #[serde(default)]
+    pub validator_strict: Option<bool>,
+    #[serde(default)]
+    pub default_tool_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub category_timeout_secs: HashMap<String, u64>,
+    #[serde(default)]
+    pub tool_timeout_secs: HashMap<String, u64>,
+    #[serde(default)]
+    pub tool_policies: HashMap<String, ToolPolicyConfig>,
+}
+
+/// 审计日志配置
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityAuditConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 0.0~1.0，默认全量记录
+    #[serde(default = "default_audit_sample_rate")]
+    pub sample_rate: f64,
+    #[serde(default = "default_true")]
+    pub include_rejected_reason: bool,
+}
+
+fn default_audit_sample_rate() -> f64 {
+    1.0
+}
+
+impl Default for SecurityAuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_rate: default_audit_sample_rate(),
+            include_rejected_reason: true,
         }
     }
 }
@@ -436,5 +582,48 @@ mod schema_tests {
         let v = serde_json::to_value(&c).unwrap();
         assert!(v.get("agents").is_some());
         assert!(v.get("providers").is_some());
+        assert!(v.get("security").is_some());
+    }
+
+    #[test]
+    fn security_defaults_are_compatible() {
+        let sec = SecurityConfig::default();
+        assert!(sec.tool_policies.is_empty());
+        assert!(sec.category_timeout_secs.is_empty());
+        assert!(sec.channel_policies.is_empty());
+        assert_eq!(sec.session_policy_mode, SessionPolicyMode::Inherit);
+        assert_eq!(sec.security_audit.sample_rate, 1.0);
+        assert!(!sec.security_audit.enabled);
+        assert_eq!(sec.docker.tmpfs_size_mb, 64);
+        assert!(sec.docker.no_new_privileges);
+    }
+
+    #[test]
+    fn security_policy_roundtrip() {
+        let j = r#"{
+          "security": {
+            "categoryTimeoutSecs": {"shell": 30},
+            "toolPolicies": {
+              "exec": {"enabled": true, "requireDocker": true, "allowNetwork": false, "riskLevel": "high", "maxArgsBytes": 2048, "denyPatterns": ["rm -rf /"]}
+            },
+            "channelPolicies": {
+              "telegram": {"validatorStrict": true, "toolTimeoutSecs": {"exec": 15}}
+            },
+            "sessionPolicyMode": "strict",
+            "securityAudit": {"enabled": true, "sampleRate": 0.5, "includeRejectedReason": true},
+            "docker": {"tmpfsSizeMb": 32, "noNewPrivileges": true}
+          }
+        }"#;
+        let c: Config = serde_json::from_str(j).expect("parse");
+        let p = c.security.tool_policies.get("exec").unwrap();
+        assert!(p.require_docker);
+        assert!(!p.allow_network);
+        assert_eq!(p.max_args_bytes, Some(2048));
+        assert_eq!(p.deny_patterns.len(), 1);
+        assert_eq!(c.security.category_timeout_secs.get("shell"), Some(&30));
+        assert!(c.security.channel_policies.get("telegram").is_some());
+        assert_eq!(c.security.session_policy_mode, SessionPolicyMode::Strict);
+        assert_eq!(c.security.docker.tmpfs_size_mb, 32);
+        assert!(c.security.security_audit.enabled);
     }
 }

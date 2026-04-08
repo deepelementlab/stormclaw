@@ -4,6 +4,7 @@
 
 .DESCRIPTION
     适用于源码归档、离线交付或在不携带 target 的情况下同步到另一台机器再执行 cargo build。
+    排除 node_modules：前端目录需在目标机器上执行 npm install / npm ci。
 
 .PARAMETER Destination
     发布目录的绝对或相对路径；若不存在则创建。
@@ -35,6 +36,7 @@ function Get-ExcludeDirectoryNames {
     $names = [System.Collections.Generic.List[string]]::new()
     foreach ($n in @(
             'target',
+            'node_modules',
             '.git',
             '.claude',
             '.vs',

@@ -55,6 +55,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
         Some(config.agents.defaults.model),
         max_iterations,
         brave_api_key,
+        config.security.clone(),
     ).await?;
 
     if let Some(message) = args.message {

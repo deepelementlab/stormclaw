@@ -112,6 +112,7 @@ impl GatewayService {
             Some(provider.get_default_model()),
             config.agents.defaults.max_tool_iterations,
             Some(brave_api_key),
+            config.security.clone(),
         ).await?);
 
         // 创建渠道管理器（共享 `shared_config`）
@@ -454,11 +455,12 @@ async fn apply_gateway_config_hot_reload(
     let brave = Some(new_config.tools.web.search.api_key.clone())
         .filter(|s| !s.is_empty());
     let ws = new_config.workspace_path();
+    let security = new_config.security.clone();
 
     *shared.write().await = new_config;
 
     agent
-        .apply_gateway_hot_reload(api_key, api_base, default_model, max_it, brave, ws)
+        .apply_gateway_hot_reload(api_key, api_base, default_model, max_it, brave, ws, security)
         .await?;
 
     channels.reload_channels().await?;
@@ -809,6 +811,7 @@ mod gateway_http_smoke_tests {
                 Some("gpt-4".into()),
                 4,
                 None,
+                stormclaw_config::SecurityConfig::default(),
             )
             .await
             .expect("agent"),

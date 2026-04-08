@@ -16,7 +16,7 @@ cfg_if::cfg_if! {
 }
 
 pub use bus::{MessageBus, InboundMessage, OutboundMessage};
-pub use agent::{AgentLoop, ContextBuilder, SubagentManager};
+pub use agent::{AgentLoop, ContextBuilder, SubagentManager, ToolExecutor, ToolInvocationContext};
 pub use providers::{LLMProvider, LLMResponse, ToolCall, ChatMessage, ToolDefinition, FunctionDefinition};
 pub use session::{Session, SessionManager};
 pub use memory::{MemoryStore};

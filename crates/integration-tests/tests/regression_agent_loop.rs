@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use stormclaw_config::SecurityConfig;
 use stormclaw_core::testing::MockLLMProvider;
 use stormclaw_core::{AgentLoop, MessageBus};
 use tempfile::tempdir;
@@ -20,6 +21,7 @@ async fn agent_loop_process_direct_mock_provider() {
         Some("gpt-4".into()),
         4,
         None,
+        SecurityConfig::default(),
     )
     .await
     .expect("AgentLoop::new");
