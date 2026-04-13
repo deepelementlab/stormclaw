@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="256" height="256" alt="Storm Claw 生猛logo设计 (8)" src="https://github.com/user-attachments/assets/0f0fb30c-8f24-4668-87fa-dc14be0513e8" />
+  <img width="256" height="256" alt="Storm Claw 生猛logo设计 (8)" src="https://github.com/user-attachments/assets/4c1edf35-7d69-4e77-a6e6-f9a7c2ae141e" />
 </p>
 
 # StormClaw
